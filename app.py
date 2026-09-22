@@ -1,169 +1,177 @@
-import streamlit as st
-import pandas as pd
+
+import io, json
 import numpy as np
+import pandas as pd
+import streamlit as st
 import matplotlib.pyplot as plt
-from io import BytesIO
+
+st.set_page_config(page_title="AI Data Analyst", page_icon="🤖", layout="wide")
+
+def clean(df):
+    df=df.dropna(how="all").copy()
+    df.columns=[str(c).strip() for c in df.columns]
+    for c in df.columns:
+        if df[c].dtype=="object":
+            df[c]=df[c].astype(str).str.strip().replace({"":"", "nan":np.nan, "None":np.nan})
+    return df
+
+def profile(df):
+    return pd.DataFrame({
+        "column":df.columns,
+        "dtype":[str(df[c].dtype) for c in df.columns],
+        "missing":[int(df[c].isna().sum()) for c in df.columns],
+        "unique":[int(df[c].nunique(dropna=True)) for c in df.columns]
+    })
+
+def stats(df):
+    n=df.select_dtypes(include=np.number)
+    if n.empty: return pd.DataFrame()
+    x=n.describe().T
+    x["median"]=n.median()
+    x["missing"]=n.isna().sum()
+    return x.reset_index().rename(columns={"index":"column"})
+
+def outliers(df):
+    rows=[]
+    for c in df.select_dtypes(include=np.number):
+        s=df[c].dropna()
+        if len(s)<4: continue
+        q1,q3=s.quantile([.25,.75]); iqr=q3-q1
+        n=0 if iqr==0 else int(((s<q1-1.5*iqr)|(s>q3+1.5*iqr)).sum())
+        rows.append({"column":c,"outliers":n,"outlier_pct":round(n/len(s)*100,2)})
+    return pd.DataFrame(rows)
+
+def correlations(df):
+    n=df.select_dtypes(include=np.number)
+    if n.shape[1]<2: return pd.DataFrame()
+    c=n.corr()
+    rows=[]
+    for i,a in enumerate(c.columns):
+        for b in c.columns[i+1:]:
+            if pd.notna(c.loc[a,b]):
+                rows.append({"column_1":a,"column_2":b,"correlation":round(float(c.loc[a,b]),3)})
+    return pd.DataFrame(rows).sort_values("correlation",key=lambda x:x.abs(),ascending=False)
+
+def insights(df):
+    x=[
+        f"Dataset has {len(df):,} rows and {len(df.columns):,} columns.",
+        f"Missing cells: {int(df.isna().sum().sum()):,}.",
+        f"Duplicate rows: {int(df.duplicated().sum()):,}."
+    ]
+    s=stats(df)
+    if not s.empty:
+        r=s.sort_values("mean",ascending=False).iloc[0]
+        x.append(f"Highest numeric mean is {r['column']} at {r['mean']:,.2f}.")
+    o=outliers(df)
+    if not o.empty and o["outliers"].max()>0:
+        r=o.sort_values("outliers",ascending=False).iloc[0]
+        x.append(f"Most outliers are in {r['column']}: {int(r['outliers'])} ({r['outlier_pct']:.2f}%).")
+    c=correlations(df)
+    if not c.empty:
+        r=c.iloc[0]
+        x.append(f"Strongest numeric relationship: {r['column_1']} vs {r['column_2']} (r={r['correlation']}).")
+    for col in df.select_dtypes(exclude=np.number).columns[:5]:
+        v=df[col].value_counts(dropna=True)
+        if not v.empty: x.append(f"Most common {col}: {v.index[0]} ({int(v.iloc[0]):,} rows).")
+    return x
+
+def ai_answer(question,df):
+    from openai import OpenAI
+    key=st.secrets.get("OPENAI_API_KEY","").strip()
+    if not key: return None,"OPENAI_API_KEY is missing from Streamlit Secrets."
+    context={
+        "shape":[len(df),len(df.columns)],
+        "columns":list(map(str,df.columns)),
+        "profile":profile(df).to_dict("records"),
+        "statistics":stats(df).round(4).to_dict("records"),
+        "outliers":outliers(df).to_dict("records"),
+        "correlations":correlations(df).head(20).to_dict("records"),
+        "automatic_insights":insights(df),
+        "sample_rows":df.head(30).to_dict("records")
+    }
+    prompt=("You are an advanced data analyst. Answer only from the supplied dataset context. "
+            "Never invent numbers. Give practical findings and exact numbers when available.\n\n"
+            "QUESTION:\n"+question+"\n\nDATA:\n"+json.dumps(context,default=str))
+    try:
+        r=OpenAI(api_key=key).responses.create(model="gpt-5.6-luna",input=prompt)
+        return r.output_text,None
+    except Exception as e:
+        return None,str(e)
+
+st.title("🤖 AI Data Analyst")
+st.caption("Upload → clean → analyze → ask AI → export")
+
+file=st.file_uploader("Upload Excel or CSV",type=["csv","xlsx","xls"])
+if not file:
+    st.info("Upload a dataset to begin.")
+    st.stop()
 
 try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
+    df=pd.read_csv(file) if file.name.lower().endswith(".csv") else pd.read_excel(file)
+    df=clean(df)
+except Exception as e:
+    st.error(f"Could not read file: {e}"); st.stop()
 
-st.set_page_config(page_title="AI Data Analyst", page_icon="📊", layout="wide")
-st.title("📊 AI Data Analyst")
-st.caption("Upload Excel/CSV → automatic analysis → charts → AI questions")
+st.success(f"Loaded: {file.name}")
+t=st.tabs(["Overview","Data Quality","Statistics","Charts","Insights","Ask AI","Report"])
 
-uploaded = st.file_uploader("Upload your Excel or CSV file", type=["xlsx", "xls", "csv"])
+with t[0]:
+    a,b,c,d=st.columns(4)
+    a.metric("Rows",f"{len(df):,}"); b.metric("Columns",f"{len(df.columns):,}")
+    c.metric("Missing",f"{int(df.isna().sum().sum()):,}"); d.metric("Duplicates",f"{int(df.duplicated().sum()):,}")
+    st.dataframe(df.head(100),use_container_width=True)
+    st.dataframe(profile(df),use_container_width=True)
 
-def make_profile(df):
-    numeric = df.select_dtypes(include=np.number).columns.tolist()
-    categorical = df.select_dtypes(include=["object", "string", "category"]).columns.tolist()
-    profile = {
-        "shape": {"rows": len(df), "columns": len(df.columns)},
-        "columns": [{"name": c, "dtype": str(df[c].dtype), "missing": int(df[c].isna().sum()), "unique": int(df[c].nunique(dropna=True))} for c in df.columns],
-        "numeric_statistics": {},
-        "categorical_top_values": {},
-        "sample_rows": df.head(50).fillna("").astype(str).to_dict(orient="records")
-    }
-    for c in numeric[:30]:
-        s = df[c].dropna()
-        if len(s):
-            profile["numeric_statistics"][c] = {
-                "mean": round(float(s.mean()), 4), "median": round(float(s.median()), 4),
-                "min": round(float(s.min()), 4), "max": round(float(s.max()), 4),
-                "std": round(float(s.std()), 4) if len(s) > 1 else 0
-            }
-    for c in categorical[:20]:
-        profile["categorical_top_values"][c] = {str(k): int(v) for k, v in df[c].value_counts(dropna=False).head(10).items()}
-    return profile
+with t[1]:
+    st.subheader("Missing values")
+    m=pd.DataFrame({"column":df.columns,"missing":[int(df[c].isna().sum()) for c in df.columns]})
+    m["missing_pct"]=(m["missing"]/max(len(df),1)*100).round(2)
+    st.dataframe(m.sort_values("missing",ascending=False),use_container_width=True)
+    st.subheader("Outliers")
+    st.dataframe(outliers(df),use_container_width=True)
 
-def ask_ai(question, profile):
-    if OpenAI is None:
-        return "OpenAI package is not installed. Add `openai` to requirements.txt and redeploy."
-    api_key = st.secrets.get("OPENAI_API_KEY", "")
-    if not api_key:
-        return "AI is not connected yet. Add OPENAI_API_KEY to Streamlit Secrets, then restart the app."
-    client = OpenAI(api_key=api_key)
-    instructions = """You are an expert data analyst. Analyze the supplied dataset profile and answer the user's question using only the available data. Do not invent values. If the profile is insufficient, say what is missing. Give calculations/comparisons when supported. Use clear headings and bullets. Mention important data-quality limitations."""
-    prompt = f"DATASET PROFILE:\n{profile}\n\nUSER QUESTION:\n{question}"
-    try:
-        response = client.responses.create(model="gpt-5.6-luna", instructions=instructions, input=prompt)
-        return response.output_text
-    except Exception as e:
-        return f"AI request failed: {e}"
+with t[2]:
+    st.subheader("Numeric statistics"); st.dataframe(stats(df),use_container_width=True)
+    st.subheader("Correlations"); st.dataframe(correlations(df).head(20),use_container_width=True)
 
-if uploaded:
-    try:
-        if uploaded.name.lower().endswith(".csv"):
-            df = pd.read_csv(uploaded)
+with t[3]:
+    nums=list(df.select_dtypes(include=np.number).columns)
+    if nums:
+        col=st.selectbox("Numeric column",nums)
+        fig,ax=plt.subplots(); ax.hist(df[col].dropna(),bins=30); ax.set_title(col); st.pyplot(fig); plt.close(fig)
+    cats=list(df.select_dtypes(exclude=np.number).columns)
+    if cats:
+        col=st.selectbox("Category column",cats)
+        vc=df[col].value_counts().head(15)
+        fig,ax=plt.subplots(); vc.plot(kind="bar",ax=ax); ax.set_title(col); st.pyplot(fig); plt.close(fig)
+
+with t[4]:
+    for i,x in enumerate(insights(df),1): st.write(f"**{i}.** {x}")
+
+with t[5]:
+    q=st.text_area("Your question",placeholder="Give me 5 important insights with numbers.")
+    if st.button("🤖 Analyze with AI",type="primary"):
+        if not q.strip(): st.warning("Write a question first.")
         else:
-            df = pd.read_excel(uploaded)
-        st.success(f"Loaded: {uploaded.name}")
-        clean = df.copy()
-        text_cols = clean.select_dtypes(include=["object", "string"]).columns
-        for col in text_cols:
-            clean[col] = clean[col].astype("string").str.strip()
-        original_rows = len(clean)
-        clean = clean.dropna(how="all").reset_index(drop=True)
-        numeric = clean.select_dtypes(include=np.number).columns.tolist()
-        categorical = clean.select_dtypes(include=["object", "string", "category"]).columns.tolist()
+            with st.spinner("Analyzing..."):
+                ans,err=ai_answer(q,df)
+            st.error(err) if err else st.markdown(ans)
+    if st.button("✨ Generate AI Insights"):
+        with st.spinner("Generating..."):
+            ans,err=ai_answer("Give 8 important insights, including data quality, outliers, relationships and category patterns. Use exact numbers.",df)
+        st.error(err) if err else st.markdown(ans)
 
-        tabs = st.tabs(["Overview", "Data Quality", "Statistics", "Charts", "Insights", "🤖 Ask AI"])
-        with tabs[0]:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Rows", f"{len(clean):,}")
-            c2.metric("Columns", f"{len(clean.columns):,}")
-            c3.metric("Missing cells", f"{int(clean.isna().sum().sum()):,}")
-            c4.metric("Duplicate rows", f"{int(clean.duplicated().sum()):,}")
-            st.subheader("Data Preview")
-            st.dataframe(clean.head(100), use_container_width=True)
-            st.subheader("Column Information")
-            info = pd.DataFrame({"Column": clean.columns, "Data Type": [str(clean[c].dtype) for c in clean.columns], "Missing": [int(clean[c].isna().sum()) for c in clean.columns], "Unique": [int(clean[c].nunique(dropna=True)) for c in clean.columns]})
-            st.dataframe(info, use_container_width=True)
-
-        with tabs[1]:
-            missing = clean.isna().sum().sort_values(ascending=False)
-            quality = pd.DataFrame({"Missing": missing, "Missing %": (missing / max(len(clean), 1) * 100).round(2), "Unique": [clean[c].nunique(dropna=True) for c in missing.index]})
-            st.subheader("Missing Values")
-            st.dataframe(quality, use_container_width=True)
-            st.write("Completely blank rows removed:", original_rows - len(clean))
-            st.write("Duplicate rows:", int(clean.duplicated().sum()))
-
-        with tabs[2]:
-            if numeric:
-                st.subheader("Descriptive Statistics")
-                st.dataframe(clean[numeric].describe().T, use_container_width=True)
-                st.subheader("Correlation Matrix")
-                if len(numeric) >= 2:
-                    st.dataframe(clean[numeric].corr().round(3), use_container_width=True)
-                else:
-                    st.info("At least two numeric columns are needed for correlation.")
-            else:
-                st.info("No numeric columns were detected.")
-
-        with tabs[3]:
-            st.subheader("Automatic Visual Analysis")
-            if numeric:
-                selected_num = st.selectbox("Choose a numeric column", numeric)
-                fig, ax = plt.subplots(figsize=(9, 4))
-                clean[selected_num].dropna().plot(kind="hist", bins=20, ax=ax)
-                ax.set_title(f"Distribution: {selected_num}")
-                ax.set_xlabel(selected_num)
-                ax.set_ylabel("Frequency")
-                st.pyplot(fig)
-                plt.close(fig)
-            if categorical:
-                selected_cat = st.selectbox("Choose a categorical column", categorical)
-                counts = clean[selected_cat].value_counts(dropna=False).head(15)
-                fig, ax = plt.subplots(figsize=(9, 5))
-                counts.sort_values().plot(kind="barh", ax=ax)
-                ax.set_title(f"Top categories: {selected_cat}")
-                ax.set_xlabel("Count")
-                st.pyplot(fig)
-                plt.close(fig)
-
-        with tabs[4]:
-            st.subheader("Automatic Analytical Insights")
-            insights = [f"The dataset contains {len(clean):,} records and {len(clean.columns):,} columns."]
-            missing_total = int(clean.isna().sum().sum())
-            if missing_total:
-                worst = clean.isna().sum().sort_values(ascending=False).head(3)
-                insights.append("Missing values are concentrated in: " + ", ".join([f"{c} ({int(v)})" for c, v in worst.items() if v > 0]) + ".")
-            else:
-                insights.append("No missing cells were detected.")
-            insights.append(f"{int(clean.duplicated().sum()):,} duplicate rows were detected.")
-            for col in numeric[:8]:
-                s = clean[col].dropna()
-                if len(s):
-                    insights.append(f"{col}: mean={s.mean():,.2f}, median={s.median():,.2f}, min={s.min():,.2f}, max={s.max():,.2f}.")
-            for item in insights:
-                st.write("• " + item)
-
-        with tabs[5]:
-            st.subheader("🤖 Ask your AI Data Analyst")
-            st.write("Ask questions about the uploaded dataset. The AI receives a compact data profile, statistics, category frequencies, and sample rows.")
-            question = st.text_area("Your question", placeholder="Example: What are the most important insights from this dataset?", height=120)
-            col_a, col_b = st.columns(2)
-            with col_a:
-                ask_button = st.button("🤖 Analyze with AI", type="primary")
-            with col_b:
-                insights_button = st.button("✨ Generate AI Insights")
-            if ask_button and question.strip():
-                with st.spinner("AI is analyzing your dataset..."):
-                    st.markdown(ask_ai(question.strip(), make_profile(clean)))
-            if insights_button:
-                with st.spinner("Generating AI insights..."):
-                    q = "Give me the 10 most important insights from this dataset, including data-quality issues, distributions, notable categories, useful comparisons, and practical next steps. Do not invent information."
-                    st.markdown(ask_ai(q, make_profile(clean)))
-            st.info("AI features require OPENAI_API_KEY in Streamlit Secrets. Never put the API key in public GitHub code.")
-
-        st.divider()
-        st.subheader("Download cleaned data")
-        out = BytesIO()
-        clean.to_excel(out, index=False)
-        out.seek(0)
-        st.download_button("⬇️ Download Cleaned Excel", data=out, file_name="cleaned_data.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    except Exception as e:
-        st.error(f"Could not analyze this file: {e}")
-else:
-    st.info("Upload a file above to start the analysis.")
+with t[6]:
+    text="# AI Data Analyst Report\n\n"+"\n".join("- "+x for x in insights(df))
+    st.text_area("Report",text,height=250)
+    st.download_button("Download Report",text,"analysis_report.txt")
+    buf=io.BytesIO()
+    with pd.ExcelWriter(buf,engine="openpyxl") as w:
+        df.to_excel(w,index=False,sheet_name="Cleaned Data")
+        profile(df).to_excel(w,index=False,sheet_name="Profile")
+        stats(df).to_excel(w,index=False,sheet_name="Statistics")
+        outliers(df).to_excel(w,index=False,sheet_name="Outliers")
+        correlations(df).to_excel(w,index=False,sheet_name="Correlations")
+    buf.seek(0)
+    st.download_button("Download Analysis Excel",buf,"AI_Data_Analyst_Results.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
