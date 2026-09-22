@@ -1,353 +1,356 @@
 
-import io
+import io, json
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Simple AI Data Analyst", page_icon="📊", layout="wide")
+st.set_page_config(page_title="AI Data Analyst V5", page_icon="📈", layout="wide")
 
-# -------------------- CLEANING --------------------
-MISSING_WORDS = ["", " ", "na", "n/a", "nan", "null", "none", "-", "--", "missing"]
-
-def clean_data(df):
-    df = df.copy()
-    original_rows, original_cols = df.shape
-
-    # Clean column names
-    df.columns = (
-        pd.Index(df.columns).astype(str)
-        .str.strip()
-        .str.replace(r"\s+", " ", regex=True)
-    )
-
-    # Remove completely blank rows/columns
-    blank_rows = int(df.isna().all(axis=1).sum())
-    blank_cols = int(df.isna().all(axis=0).sum())
-    df = df.dropna(how="all").dropna(axis=1, how="all")
-
-    # Clean text and standard missing values
+def clean(df):
+    df=df.dropna(how="all").copy()
+    df.columns=[str(c).strip() for c in df.columns]
     for c in df.columns:
-        if df[c].dtype == "object":
-            s = df[c].astype("string").str.strip()
-            lower = s.str.lower()
-            s = s.mask(lower.isin(MISSING_WORDS))
-            df[c] = s
+        if df[c].dtype=="object":
+            df[c]=df[c].astype(str).str.strip().replace({"":"", "nan":np.nan, "None":np.nan})
+    return df
 
-    # Remove exact duplicate rows
-    duplicates = int(df.duplicated().sum())
-    df = df.drop_duplicates().reset_index(drop=True)
-
-    # Try numeric conversion only when most non-missing values look numeric
-    for c in df.columns:
-        if df[c].dtype == "object" or str(df[c].dtype) == "string":
-            s = df[c]
-            nonnull = s.dropna()
-            if len(nonnull) >= 3:
-                converted = pd.to_numeric(
-                    s.astype("string").str.replace(",", "", regex=False).str.replace("%", "", regex=False),
-                    errors="coerce"
-                )
-                success = converted.notna().sum() / max(nonnull.notna().sum(), 1)
-                if success >= 0.85:
-                    df[c] = converted
-
-    return df, {
-        "original_rows": original_rows,
-        "original_columns": original_cols,
-        "blank_rows_removed": blank_rows,
-        "blank_columns_removed": blank_cols,
-        "duplicates_removed": duplicates,
-        "final_rows": len(df),
-        "final_columns": len(df.columns),
-        "missing_cells": int(df.isna().sum().sum())
-    }
-
-def quality_table(df):
-    out = pd.DataFrame({
-        "Column": df.columns,
-        "Data type": [str(df[c].dtype) for c in df.columns],
-        "Missing": [int(df[c].isna().sum()) for c in df.columns],
-        "Missing %": [(df[c].isna().mean()*100).round(2) for c in df.columns],
-        "Unique values": [int(df[c].nunique(dropna=True)) for c in df.columns]
+def profile(df):
+    return pd.DataFrame({
+        "column":df.columns,
+        "dtype":[str(df[c].dtype) for c in df.columns],
+        "missing":[int(df[c].isna().sum()) for c in df.columns],
+        "unique":[int(df[c].nunique(dropna=True)) for c in df.columns]
     })
+
+def stats(df):
+    n=df.select_dtypes(include=np.number)
+    if n.empty: return pd.DataFrame()
+    x=n.describe().T
+    x["median"]=n.median(); x["missing"]=n.isna().sum(); x["range"]=n.max()-n.min()
+    return x.reset_index().rename(columns={"index":"column"})
+
+def outliers(df):
+    rows=[]
+    for c in df.select_dtypes(include=np.number):
+        s=df[c].dropna()
+        if len(s)<4: continue
+        q1,q3=s.quantile([.25,.75]); iqr=q3-q1
+        n=0 if iqr==0 else int(((s<q1-1.5*iqr)|(s>q3+1.5*iqr)).sum())
+        rows.append({"column":c,"outliers":n,"outlier_pct":round(n/len(s)*100,2)})
+    return pd.DataFrame(rows).sort_values("outliers",ascending=False) if rows else pd.DataFrame()
+
+def correlations(df):
+    n=df.select_dtypes(include=np.number)
+    if n.shape[1]<2: return pd.DataFrame()
+    c=n.corr(); rows=[]
+    for i,a in enumerate(c.columns):
+        for b in c.columns[i+1:]:
+            if pd.notna(c.loc[a,b]):
+                rows.append({"column_1":a,"column_2":b,"correlation":round(float(c.loc[a,b]),3)})
+    return pd.DataFrame(rows).sort_values("correlation",key=lambda x:x.abs(),ascending=False) if rows else pd.DataFrame()
+
+def category_patterns(df, limit=8):
+    rows=[]
+    for c in df.select_dtypes(exclude=np.number).columns:
+        vc=df[c].value_counts(dropna=True).head(limit)
+        for value,count in vc.items():
+            rows.append({"column":c,"value":str(value),"count":int(count),"share_pct":round(count/len(df)*100,2)})
+    return pd.DataFrame(rows)
+
+# ---------- V5: Smart Trend & Time-Series ----------
+def detect_date_columns(df):
+    """Return likely date columns, scored by successful parsing and date-like column names."""
+    candidates=[]
+    date_words=("date","time","day","month","year","timestamp","created","updated","order","invoice","transaction")
+    for c in df.columns:
+        s=df[c]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            parsed=s
+        else:
+            if pd.api.types.is_numeric_dtype(s):
+                continue
+            parsed=pd.to_datetime(s, errors="coerce")
+        valid=parsed.notna().mean() if len(parsed) else 0
+        name_score=any(w in str(c).lower() for w in date_words)
+        if valid >= 0.70 or (name_score and valid >= 0.40):
+            candidates.append((c, float(valid), name_score))
+    candidates.sort(key=lambda x:(x[2],x[1]), reverse=True)
+    return [x[0] for x in candidates]
+
+def prepare_time_data(df, date_col, value_col, freq):
+    x=df[[date_col,value_col]].copy()
+    x[date_col]=pd.to_datetime(x[date_col], errors="coerce")
+    x[value_col]=pd.to_numeric(x[value_col], errors="coerce")
+    x=x.dropna()
+    if x.empty: return pd.DataFrame()
+    x=x.sort_values(date_col)
+    rule={"Daily":"D","Weekly":"W","Monthly":"ME","Yearly":"YE"}[freq]
+    # For compatibility with older pandas, fall back from ME/YE.
+    try:
+        g=x.set_index(date_col)[value_col].resample(rule).sum().dropna()
+    except ValueError:
+        fallback={"ME":"M","YE":"Y"}[rule] if rule in ("ME","YE") else rule
+        g=x.set_index(date_col)[value_col].resample(fallback).sum().dropna()
+    out=g.reset_index(name="value")
+    out["period"]=out[date_col].dt.strftime(
+        "%Y-%m-%d" if freq=="Daily" else ("%Y-%m" if freq=="Monthly" else "%Y")
+    )
+    out["change"]=out["value"].diff()
+    out["growth_pct"]=out["value"].pct_change().replace([np.inf,-np.inf],np.nan)*100
     return out
 
-# -------------------- PIVOTS --------------------
-def numeric_columns(df):
-    return list(df.select_dtypes(include=np.number).columns)
+def trend_summary(ts, value_col):
+    if ts.empty: return []
+    first=float(ts["value"].iloc[0]); last=float(ts["value"].iloc[-1])
+    change=last-first
+    pct=(change/first*100) if first!=0 else np.nan
+    peak=ts.loc[ts["value"].idxmax()]
+    low=ts.loc[ts["value"].idxmin()]
+    direction="increased" if change>0 else ("decreased" if change<0 else "remained stable")
+    return [
+        f"{value_col}: {direction} from {first:,.2f} to {last:,.2f} ({pct:+.2f}% overall change)." if pd.notna(pct)
+        else f"{value_col}: changed from {first:,.2f} to {last:,.2f}; percentage change is unavailable because the first value is zero.",
+        f"Highest period: {peak['period']} ({peak['value']:,.2f}).",
+        f"Lowest period: {low['period']} ({low['value']:,.2f})."
+    ]
 
-def categorical_columns(df):
-    return list(df.select_dtypes(exclude=np.number).columns)
-
-def make_pivot(df, category, value, agg):
-    x = df[[category, value]].copy()
-    x[value] = pd.to_numeric(x[value], errors="coerce")
-    x = x.dropna(subset=[category, value])
-    if x.empty:
-        return pd.DataFrame()
-    if agg == "Sum":
-        p = x.groupby(category, as_index=False)[value].sum()
-    elif agg == "Average":
-        p = x.groupby(category, as_index=False)[value].mean()
-    elif agg == "Count":
-        p = x.groupby(category, as_index=False)[value].count()
-    elif agg == "Maximum":
-        p = x.groupby(category, as_index=False)[value].max()
+def linear_forecast(ts, periods=3):
+    if len(ts)<3: return pd.DataFrame()
+    y=ts["value"].astype(float).to_numpy()
+    x=np.arange(len(y),dtype=float)
+    slope,intercept=np.polyfit(x,y,1)
+    future_x=np.arange(len(y),len(y)+periods,dtype=float)
+    pred=intercept+slope*future_x
+    last_date=pd.to_datetime(ts.iloc[-1]["period"] + ("-01" if len(str(ts.iloc[-1]["period"]))==7 else ""), errors="coerce")
+    if pd.isna(last_date):
+        last_date=pd.to_datetime(ts.iloc[-1].iloc[0])
+    # Forecast labels based on the selected period spacing.
+    date_col=ts.columns[0]
+    last_dt=pd.to_datetime(ts.iloc[-1][date_col])
+    if len(ts)>1:
+        step=pd.to_timedelta(np.median(np.diff(pd.to_datetime(ts[date_col]).astype("int64"))),unit="ns")
     else:
-        p = x.groupby(category, as_index=False)[value].min()
-    return p.sort_values(value, ascending=False)
+        step=pd.Timedelta(days=30)
+    dates=[last_dt + step*(i+1) for i in range(periods)]
+    return pd.DataFrame({"forecast_date":dates,"forecast":pred})
 
-def date_columns(df):
-    result = []
-    for c in df.columns:
-        if pd.api.types.is_datetime64_any_dtype(df[c]):
-            result.append(c)
-            continue
-        if pd.api.types.is_numeric_dtype(df[c]):
-            continue
-        parsed = pd.to_datetime(df[c], errors="coerce")
-        if len(df) and parsed.notna().mean() >= 0.75:
-            result.append(c)
-    return result
+def automatic_insights(df):
+    x=[
+        f"Dataset contains {len(df):,} rows and {len(df.columns):,} columns.",
+        f"Missing cells: {int(df.isna().sum().sum()):,}.",
+        f"Duplicate rows: {int(df.duplicated().sum()):,}."
+    ]
+    s=stats(df)
+    if not s.empty:
+        r=s.sort_values("mean",ascending=False).iloc[0]
+        x.append(f"Highest numeric mean: {r['column']} = {r['mean']:,.2f}.")
+    o=outliers(df)
+    if not o.empty and o.iloc[0]["outliers"]>0:
+        r=o.iloc[0]; x.append(f"Most outliers: {r['column']} ({int(r['outliers'])}, {r['outlier_pct']:.2f}%).")
+    c=correlations(df)
+    if not c.empty:
+        r=c.iloc[0]; x.append(f"Strongest numeric relationship: {r['column_1']} vs {r['column_2']} (r={r['correlation']}).")
+    for col in df.select_dtypes(exclude=np.number).columns[:6]:
+        vc=df[col].value_counts(dropna=True)
+        if not vc.empty: x.append(f"Most common {col}: {vc.index[0]} ({int(vc.iloc[0]):,} rows).")
+    return x
 
-def time_pivot(df, date_col, value_col, period):
-    x = df[[date_col, value_col]].copy()
-    x[date_col] = pd.to_datetime(x[date_col], errors="coerce")
-    x[value_col] = pd.to_numeric(x[value_col], errors="coerce")
-    x = x.dropna()
-    if x.empty:
-        return pd.DataFrame()
-    rule = {"Daily":"D", "Weekly":"W", "Monthly":"ME", "Yearly":"YE"}[period]
+def business_analysis(df):
+    nums=df.select_dtypes(include=np.number)
+    return {
+        "kpis":{"rows":len(df),"columns":len(df.columns),"missing_cells":int(df.isna().sum().sum()),
+                "duplicate_rows":int(df.duplicated().sum()),"numeric_columns":len(nums.columns),
+                "categorical_columns":len(df.select_dtypes(exclude=np.number).columns)},
+        "numeric_summary":stats(df).to_dict("records"),
+        "outliers":outliers(df).to_dict("records"),
+        "correlations":correlations(df).head(20).to_dict("records"),
+        "category_patterns":category_patterns(df).to_dict("records"),
+        "automatic_insights":automatic_insights(df)
+    }
+
+def ask_ai(question, context):
     try:
-        y = x.set_index(date_col)[value_col].resample(rule).sum().dropna()
-    except ValueError:
-        y = x.set_index(date_col)[value_col].resample({"ME":"M","YE":"Y"}.get(rule, rule)).sum().dropna()
-    return y.reset_index(name=value_col)
+        from openai import OpenAI
+        key=st.secrets.get("OPENAI_API_KEY","").strip()
+        if not key: return None,"OPENAI_API_KEY is missing from Streamlit Secrets."
+        prompt=f"""You are an advanced data analyst.
+Use ONLY the supplied computed dataset context. Never invent numbers.
+Explain findings clearly and distinguish facts from recommendations.
 
-# -------------------- UI --------------------
-st.title("📊 Simple AI Data Analyst")
-st.caption("A simple workflow: 1) Clean data → 2) Create important Pivot Tables → 3) Make Charts → 4) Understand the results")
+USER REQUEST:
+{question}
 
-file = st.file_uploader("📁 Step 1 — Upload your Excel or CSV file", type=["csv", "xlsx", "xls"])
+COMPUTED DATASET CONTEXT:
+{json.dumps(context,default=str)}
+"""
+        r=OpenAI(api_key=key).responses.create(model="gpt-5.6-luna",input=prompt)
+        return r.output_text,None
+    except Exception as e: return None,str(e)
 
+# ---------- App ----------
+st.title("🤖 AI Data Analyst V5")
+st.caption("Upload → analyze → smart trends → forecasting → AI insights → export")
+
+file=st.file_uploader("Upload Excel or CSV",type=["csv","xlsx","xls"])
 if not file:
-    st.info("Upload your dataset to start. You will see the analysis in simple steps.")
-    st.stop()
+    st.info("Upload a dataset to begin."); st.stop()
 
 try:
-    raw = pd.read_csv(file) if file.name.lower().endswith(".csv") else pd.read_excel(file)
+    df=pd.read_csv(file) if file.name.lower().endswith(".csv") else pd.read_excel(file)
+    df=clean(df)
 except Exception as e:
-    st.error(f"Could not read the file: {e}")
-    st.stop()
+    st.error(f"Could not read file: {e}"); st.stop()
 
-cleaned, cleaning_info = clean_data(raw)
+st.success(f"Loaded: {file.name}")
+t=st.tabs(["Overview","Data Quality","Statistics","Charts","Insights","🎯 Business Analysis","📈 V5 Trends","Ask AI","Report"])
 
-tabs = st.tabs([
-    "🧹 1. Clean Data",
-    "📋 2. Pivot Tables",
-    "📊 3. Charts",
-    "📅 4. Time Trends",
-    "💡 5. Simple Insights",
-    "⬇️ 6. Export"
-])
+with t[0]:
+    a,b,c,d=st.columns(4)
+    a.metric("Rows",f"{len(df):,}"); b.metric("Columns",f"{len(df.columns):,}")
+    c.metric("Missing",f"{int(df.isna().sum().sum()):,}"); d.metric("Duplicates",f"{int(df.duplicated().sum()):,}")
+    st.dataframe(df.head(100),use_container_width=True); st.dataframe(profile(df),use_container_width=True)
 
-# -------------------- CLEAN --------------------
-with tabs[0]:
-    st.header("🧹 Step 1 — Data Cleaning")
-    st.write("**Goal:** make the dataset ready for analysis. The original file is never changed.")
+with t[1]:
+    m=pd.DataFrame({"column":df.columns,"missing":[int(df[c].isna().sum()) for c in df.columns]})
+    m["missing_pct"]=(m["missing"]/max(len(df),1)*100).round(2)
+    st.subheader("Missing Values"); st.dataframe(m.sort_values("missing",ascending=False),use_container_width=True)
+    st.subheader("Outliers (IQR)"); st.dataframe(outliers(df),use_container_width=True)
 
-    a,b,c,d = st.columns(4)
-    a.metric("Original rows", f"{cleaning_info['original_rows']:,}")
-    b.metric("Duplicates removed", f"{cleaning_info['duplicates_removed']:,}")
-    c.metric("Blank rows removed", f"{cleaning_info['blank_rows_removed']:,}")
-    d.metric("Missing cells left", f"{cleaning_info['missing_cells']:,}")
+with t[2]:
+    st.subheader("Numeric Statistics"); st.dataframe(stats(df),use_container_width=True)
+    st.subheader("Correlations"); st.dataframe(correlations(df).head(20),use_container_width=True)
 
-    st.subheader("What was cleaned?")
-    st.write("✅ Column names were trimmed")
-    st.write("✅ Completely blank rows/columns removed")
-    st.write("✅ Extra spaces removed from text")
-    st.write("✅ Common missing-value labels (NA, N/A, null, -, etc.) converted to blanks")
-    st.write("✅ Exact duplicate rows removed")
-    st.write("✅ Numeric-looking columns converted to numbers")
+with t[3]:
+    nums=list(df.select_dtypes(include=np.number).columns)
+    if nums:
+        col=st.selectbox("Numeric column",nums,key="hist_col")
+        fig,ax=plt.subplots(); ax.hist(df[col].dropna(),bins=30); ax.set_title(f"Distribution: {col}")
+        ax.set_xlabel(col); ax.set_ylabel("Frequency"); st.pyplot(fig); plt.close(fig)
+    cats=list(df.select_dtypes(exclude=np.number).columns)
+    if cats:
+        col=st.selectbox("Categorical column",cats,key="cat_col"); vc=df[col].value_counts().head(15)
+        fig,ax=plt.subplots(); vc.plot(kind="bar",ax=ax); ax.set_title(f"Top categories: {col}")
+        ax.set_ylabel("Count"); st.pyplot(fig); plt.close(fig)
 
-    st.subheader("Cleaned data preview")
-    st.dataframe(cleaned.head(100), use_container_width=True)
+with t[4]:
+    st.subheader("Automatic Insights")
+    for i,x in enumerate(automatic_insights(df),1): st.write(f"**{i}.** {x}")
 
-    st.subheader("Data quality after cleaning")
-    st.dataframe(quality_table(cleaned), use_container_width=True)
+with t[5]:
+    st.subheader("🎯 Automatic Business Analysis")
+    ba=business_analysis(df); k=ba["kpis"]
+    a,b,c,d,e,f=st.columns(6)
+    a.metric("Rows",f"{k['rows']:,}"); b.metric("Columns",f"{k['columns']:,}"); c.metric("Missing",f"{k['missing_cells']:,}")
+    d.metric("Duplicates",f"{k['duplicate_rows']:,}"); e.metric("Numeric",k["numeric_columns"]); f.metric("Categorical",k["categorical_columns"])
+    st.markdown("### Key Findings")
+    for i,x in enumerate(ba["automatic_insights"],1): st.write(f"**{i}.** {x}")
+    st.markdown("### Outlier Signals"); st.dataframe(outliers(df),use_container_width=True)
+    st.markdown("### Strong Relationships"); st.dataframe(correlations(df).head(10),use_container_width=True)
+    st.markdown("### Top Category Patterns"); st.dataframe(category_patterns(df).head(30),use_container_width=True)
+    if st.button("🤖 Generate Business Recommendations",type="primary"):
+        with st.spinner("Generating recommendations..."):
+            ans,err=ask_ai("Based on these computed results, give 6 practical recommendations. Cite exact evidence/numbers and do not invent context.",ba)
+        if err: st.error(err)
+        else: st.markdown(ans)
 
-    missing = quality_table(cleaned)
-    missing = missing[missing["Missing"] > 0]
-    if not missing.empty:
-        st.warning("Some values are still missing. They are NOT automatically deleted because sometimes missing values are meaningful.")
-        st.dataframe(missing, use_container_width=True)
+with t[6]:
+    st.subheader("📈 Smart Trend & Time-Series Analysis")
+    date_candidates=detect_date_columns(df)
+    if not date_candidates:
+        st.warning("No reliable date column was detected. Make sure your dataset contains a Date/Time column.")
     else:
-        st.success("Excellent — no missing cells remain.")
-
-# -------------------- PIVOTS --------------------
-with tabs[1]:
-    st.header("📋 Step 2 — Important Pivot Tables")
-    st.write("**What is a Pivot Table?** It summarizes many rows into a simple answer such as “sales by product” or “quantity by city”.")
-
-    cats = categorical_columns(cleaned)
-    nums = numeric_columns(cleaned)
-
-    if not cats or not nums:
-        st.warning("A useful pivot normally needs at least one category column and one numeric column.")
-    else:
-        st.subheader("Pivot 1 — Summary by Category")
-        c1,c2,c3 = st.columns(3)
-        cat = c1.selectbox("Group by", cats)
-        val = c2.selectbox("Calculate", nums)
-        agg = c3.selectbox("Calculation", ["Sum", "Average", "Count", "Maximum", "Minimum"])
-        p1 = make_pivot(cleaned, cat, val, agg)
-        if not p1.empty:
-            st.dataframe(p1, use_container_width=True)
-            st.caption(f"Meaning: this table shows {agg.lower()} of **{val}** for every **{cat}**.")
-
-        st.subheader("Pivot 2 — Top 10")
-        top = p1.head(10) if not p1.empty else pd.DataFrame()
-        if not top.empty:
-            st.dataframe(top, use_container_width=True)
-            st.caption("This quickly shows the biggest categories.")
-
-        st.subheader("Pivot 3 — Category Count")
-        counts = cleaned[cat].value_counts(dropna=True).head(15).reset_index()
-        counts.columns = [cat, "Count"]
-        st.dataframe(counts, use_container_width=True)
-        st.caption(f"Meaning: how many records belong to each **{cat}**.")
-
-# -------------------- CHARTS --------------------
-with tabs[2]:
-    st.header("📊 Step 3 — Charts")
-    st.write("Charts are created from the same summaries above, so the chart is easy to understand.")
-
-    cats = categorical_columns(cleaned)
-    nums = numeric_columns(cleaned)
-
-    if cats and nums:
-        cat = st.selectbox("Choose category", cats, key="chart_cat")
-        val = st.selectbox("Choose numeric value", nums, key="chart_val")
-        agg = st.selectbox("How to calculate", ["Sum", "Average", "Count"], key="chart_agg")
-        p = make_pivot(cleaned, cat, val, agg).head(15)
-
-        if not p.empty:
-            fig, ax = plt.subplots(figsize=(10,5))
-            ax.bar(p[cat].astype(str), p[val])
-            ax.set_title(f"{agg} of {val} by {cat}")
-            ax.set_xlabel(cat)
-            ax.set_ylabel(f"{agg} of {val}")
-            plt.xticks(rotation=45, ha="right")
-            plt.tight_layout()
-            st.pyplot(fig)
-            plt.close(fig)
-            st.info("How to read it: taller bars mean a larger value. Compare the categories from left to right.")
-
-# -------------------- TIME --------------------
-with tabs[3]:
-    st.header("📅 Step 4 — Time Trends")
-    st.write("If your data has a date column, this section shows how a value changes over time.")
-
-    dates = date_columns(cleaned)
-    nums = numeric_columns(cleaned)
-
-    if not dates:
-        st.info("No clear date column was detected. You can still use the Pivot Tables and Charts.")
-    elif not nums:
-        st.warning("A numeric column is needed for a time trend.")
-    else:
-        c1,c2 = st.columns(2)
-        dc = c1.selectbox("Date column", dates)
-        vc = c2.selectbox("Value column", nums)
-        period = st.selectbox("Time period", ["Monthly","Weekly","Daily","Yearly"], index=0)
-        trend = time_pivot(cleaned, dc, vc, period)
-
-        if trend.empty:
-            st.warning("There is not enough valid date/value data.")
+        st.success("Detected date column(s): " + ", ".join(date_candidates))
+        date_col=st.selectbox("Date column",date_candidates)
+        numeric_cols=list(df.select_dtypes(include=np.number).columns)
+        if not numeric_cols:
+            st.warning("A numeric column is required for trend analysis.")
         else:
-            st.dataframe(trend, use_container_width=True)
-            fig, ax = plt.subplots(figsize=(10,5))
-            ax.plot(trend[dc], trend[vc], marker="o")
-            ax.set_title(f"{vc} trend — {period}")
-            ax.set_xlabel("Date")
-            ax.set_ylabel(vc)
-            ax.grid(alpha=0.25)
-            plt.tight_layout()
-            st.pyplot(fig)
-            plt.close(fig)
-
-            first = float(trend[vc].iloc[0])
-            last = float(trend[vc].iloc[-1])
-            change = last-first
-            pct = change/first*100 if first != 0 else np.nan
-            if change > 0:
-                st.success(f"Simple explanation: the value increased from {first:,.2f} to {last:,.2f}.")
-            elif change < 0:
-                st.warning(f"Simple explanation: the value decreased from {first:,.2f} to {last:,.2f}.")
+            value_col=st.selectbox("Measure / value column",numeric_cols)
+            freq=st.selectbox("Trend period",["Daily","Weekly","Monthly","Yearly"],index=2)
+            ts=prepare_time_data(df,date_col,value_col,freq)
+            if ts.empty:
+                st.warning("Not enough valid date/value data after conversion.")
             else:
-                st.info("Simple explanation: the first and last period have the same value.")
-            if np.isfinite(pct):
-                st.write(f"Overall change: **{pct:+.2f}%**")
-            st.write(f"Highest period: **{trend.loc[trend[vc].idxmax(), dc]}**")
-            st.write(f"Lowest period: **{trend.loc[trend[vc].idxmin(), dc]}**")
+                st.markdown("### Trend Summary")
+                for x in trend_summary(ts,value_col): st.write("• "+x)
+                a,b,c=st.columns(3)
+                a.metric("Periods",f"{len(ts):,}")
+                a.metric("Highest",f"{ts['value'].max():,.2f}")
+                b.metric("Lowest",f"{ts['value'].min():,.2f}")
+                c.metric("Latest",f"{ts['value'].iloc[-1]:,.2f}")
+                st.markdown("### Trend Table")
+                st.dataframe(ts,use_container_width=True)
 
-# -------------------- INSIGHTS --------------------
-with tabs[4]:
-    st.header("💡 Step 5 — Simple Insights")
-    st.write("These are simple, data-based observations — no complicated statistics required.")
+                fig,ax=plt.subplots()
+                ax.plot(pd.to_datetime(ts[date_col]),ts["value"],marker="o")
+                ax.set_title(f"{freq} Trend — {value_col}")
+                ax.set_xlabel("Date"); ax.set_ylabel(value_col); ax.grid(alpha=.25)
+                st.pyplot(fig); plt.close(fig)
 
-    nums = numeric_columns(cleaned)
-    cats = categorical_columns(cleaned)
+                st.markdown("### 📊 Growth / Decline")
+                gd=ts[[date_col,"period","value","change","growth_pct"]].copy()
+                gd["growth_pct"]=gd["growth_pct"].round(2)
+                st.dataframe(gd,use_container_width=True)
 
-    st.subheader("Dataset overview")
-    st.write(f"• **{len(cleaned):,}** rows and **{len(cleaned.columns):,}** columns")
-    st.write(f"• **{len(nums)}** numeric columns and **{len(cats)}** category/text columns")
-    st.write(f"• **{int(cleaned.isna().sum().sum()):,}** missing cells after cleaning")
+                st.markdown("### 🔮 Forecast")
+                if len(ts)<3:
+                    st.info("At least 3 time periods are required for the basic forecast.")
+                else:
+                    horizon=st.slider("Forecast periods",1,12,3)
+                    fc=linear_forecast(ts,horizon)
+                    st.dataframe(fc,use_container_width=True)
+                    fig,ax=plt.subplots()
+                    ax.plot(pd.to_datetime(ts[date_col]),ts["value"],marker="o",label="Historical")
+                    ax.plot(fc["forecast_date"],fc["forecast"],marker="o",linestyle="--",label="Forecast")
+                    ax.set_title(f"{freq} Trend + Forecast — {value_col}")
+                    ax.set_xlabel("Date"); ax.set_ylabel(value_col); ax.legend(); ax.grid(alpha=.25)
+                    st.pyplot(fig); plt.close(fig)
 
-    if cats and nums:
-        cat = cats[0]
-        val = nums[0]
-        p = make_pivot(cleaned, cat, val, "Sum")
-        if not p.empty:
-            high = p.iloc[0]
-            low = p.iloc[-1]
-            st.subheader("Important findings")
-            st.write(f"🔝 Highest **{val}** category: **{high[cat]}** ({high[val]:,.2f})")
-            st.write(f"🔻 Lowest **{val}** category: **{low[cat]}** ({low[val]:,.2f})")
-            st.write(f"🏆 Total **{val}: {p[val].sum():,.2f}**")
+                if st.button("🤖 Explain This Trend with AI"):
+                    context={"date_column":date_col,"value_column":value_col,"frequency":freq,
+                             "trend_summary":trend_summary(ts,value_col),
+                             "trend_table":ts.to_dict("records")}
+                    if len(ts)>=3: context["forecast"]=linear_forecast(ts,3).to_dict("records")
+                    with st.spinner("Generating trend explanation..."):
+                        ans,err=ask_ai("Explain the trend in simple language. Mention overall direction, highest/lowest periods, growth/decline and forecast if supplied. Use only the computed data.",context)
+                    if err: st.error(err)
+                    else: st.markdown(ans)
 
-# -------------------- EXPORT --------------------
-with tabs[5]:
-    st.header("⬇️ Step 6 — Export")
-    st.write("Download the cleaned data and analysis tables.")
+with t[7]:
+    q=st.text_area("Ask your AI Data Analyst",placeholder="Which findings are most important and why?",key="ask_q")
+    if st.button("🤖 Analyze with AI",type="primary",key="ask_btn"):
+        if not q.strip(): st.warning("Write a question first.")
+        else:
+            with st.spinner("Analyzing..."):
+                ans,err=ask_ai(q,business_analysis(df))
+            if err: st.error(err)
+            else: st.markdown(ans)
+    if st.button("✨ Generate AI Insights",key="insight_btn"):
+        with st.spinner("Generating..."):
+            ans,err=ask_ai("Give 8 important insights from this dataset. Include data quality, outliers, relationships and category patterns with exact numbers.",business_analysis(df))
+        if err: st.error(err)
+        else: st.markdown(ans)
 
-    cleaned_buf = io.BytesIO()
-    with pd.ExcelWriter(cleaned_buf, engine="openpyxl") as writer:
-        cleaned.to_excel(writer, index=False, sheet_name="Cleaned Data")
-        quality_table(cleaned).to_excel(writer, index=False, sheet_name="Data Quality")
-
-        cats = categorical_columns(cleaned)
-        nums = numeric_columns(cleaned)
-        if cats and nums:
-            p = make_pivot(cleaned, cats[0], nums[0], "Sum")
-            p.to_excel(writer, index=False, sheet_name="Pivot Summary")
-
-        dates = date_columns(cleaned)
-        if dates and nums:
-            t = time_pivot(cleaned, dates[0], nums[0], "Monthly")
-            t.to_excel(writer, index=False, sheet_name="Monthly Trend")
-
-    cleaned_buf.seek(0)
-    st.download_button(
-        "⬇️ Download Complete Analysis Excel",
-        cleaned_buf,
-        "Simple_AI_Data_Analyst_Analysis.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-    csv = cleaned.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Download Cleaned CSV", csv, "Cleaned_Data.csv", "text/csv")
-
-st.divider()
-st.caption("Simple AI Data Analyst — designed for beginners: Clean → Pivot → Chart → Understand → Export")
+with t[8]:
+    report=["# AI Data Analyst V5 Report","",f"File: {file.name}",""]+["- "+x for x in automatic_insights(df)]
+    date_candidates=detect_date_columns(df)
+    if date_candidates and len(df.select_dtypes(include=np.number).columns):
+        report += ["","## Detected Time-Series","- Date column: "+date_candidates[0]]
+    text="\n".join(report)
+    st.text_area("Report Preview",text,height=250)
+    st.download_button("⬇️ Download Report",text,"AI_Data_Analyst_V5_Report.txt")
+    buf=io.BytesIO()
+    with pd.ExcelWriter(buf,engine="openpyxl") as w:
+        df.to_excel(w,index=False,sheet_name="Cleaned Data")
+        profile(df).to_excel(w,index=False,sheet_name="Profile")
+        stats(df).to_excel(w,index=False,sheet_name="Statistics")
+        outliers(df).to_excel(w,index=False,sheet_name="Outliers")
+        correlations(df).to_excel(w,index=False,sheet_name="Correlations")
+        category_patterns(df).to_excel(w,index=False,sheet_name="Categories")
+        if date_candidates and len(df.select_dtypes(include=np.number).columns):
+            tc=prepare_time_data(df,date_candidates[0],df.select_dtypes(include=np.number).columns[0],"Monthly")
+            if not tc.empty: tc.to_excel(w,index=False,sheet_name="Monthly Trend")
+    buf.seek(0)
+    st.download_button("⬇️ Download Analysis Excel",buf,"AI_Data_Analyst_V5_Results.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
