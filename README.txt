@@ -1,15 +1,16 @@
-AI Data Analyst V5
-==================
-Run:
-  pip install -r requirements.txt
-  streamlit run app.py
+SIMPLE AI DATA ANALYST
+========================
 
-V5 adds:
-- Automatic date-column detection
-- Daily/Weekly/Monthly/Yearly trend analysis
-- Growth/decline percentage
-- Highest/lowest/latest period
-- Trend charts
-- Basic linear forecasting
-- AI trend explanation
-- Trend data in exported Excel
+This version is designed for beginners.
+
+WORKFLOW:
+1. Upload Excel/CSV
+2. Clean Data
+3. Create important Pivot Tables
+4. Create Charts
+5. Understand simple insights
+6. Export cleaned data and analysis
+
+RUN:
+pip install -r requirements.txt
+streamlit run app.py
