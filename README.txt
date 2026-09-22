@@ -1,1 +1,1 @@
-AI Data Analyst V3: advanced statistics, outliers, correlations, automatic insights, AI questions, reports and Excel export.
+V4 adds automatic Business Analysis, KPI summary, category patterns, outlier signals, correlations and AI recommendations.
