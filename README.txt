@@ -1,26 +1,18 @@
-# AI Data Analyst Website
+AI Data Analyst - Version 2
 
-## Run locally
-1. Install Python.
-2. Open a terminal in this folder.
-3. Run:
-   pip install -r requirements.txt
-4. Then run:
-   streamlit run app.py
-
-The browser will open the website.
-
-## What it currently does
+Features:
 - Excel/CSV upload
-- Automatic data preview
-- Missing-value report
-- Duplicate detection
-- Data types and unique counts
-- Descriptive statistics
-- Correlation matrix
-- Automatic charts
-- Basic analytical insights
-- Cleaned Excel download
+- Data cleaning
+- Data quality checks
+- Statistics and correlation
+- Charts
+- Automatic insights
+- AI question box using the OpenAI Responses API
 
-## Important
-This is the first working version. It does not yet connect to an AI API, SQL server, or Power BI. Those can be added in the next version.
+Streamlit Cloud setup:
+1. Replace the old app.py with this app.py in GitHub.
+2. Replace requirements.txt with this requirements.txt.
+3. In Streamlit app settings, add a secret named OPENAI_API_KEY.
+4. Save/restart the app.
+
+Never publish the API key in GitHub or in app.py.
